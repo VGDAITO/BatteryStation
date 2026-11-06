@@ -1,37 +1,51 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+﻿
+using System;
+using System.Threading;
 
 namespace BatteryStation
 {
-    internal class CellProcessor
+    internal class CellProcessor : IDisposable
     {
-        private readonly SemaphoreSlim _charger = new SemaphoreSlim(4);
+        private readonly SemaphoreSlim _charger;
         private readonly Mutex _calibrationMutex = new Mutex();
+
+        private static readonly object _consoleLock = new object();
+
+        public CellProcessor(int chargerSlots)
+        {
+            _charger = new SemaphoreSlim(chargerSlots);
+        }
+
+        private void Log(Cell cell, string message)
+        {
+            lock (_consoleLock)
+            {
+                Console.WriteLine(
+                    $"[{DateTime.Now:HH:mm:ss.fff}] " +
+                    $"Поток {Thread.CurrentThread.ManagedThreadId} | " +
+                    $"Ячейка {cell.Id} | {message} | Статус: {cell.Status}"
+                );
+            }
+        }
 
         public CellResult ProcessCell(Cell cell, CancellationToken token)
         {
             DateTime start = DateTime.Now;
-
             string? error = null;
 
             bool isChargerAcquired = false;
             bool isMutexAcquired = false;
 
-
-
-
-
-
             try
             {
-                cell.Status = Cell.CellStatus.Diagnostics;
-
                 token.ThrowIfCancellationRequested();
 
-                double result = 0;
+                // 1. Диагностика
+
+                cell.Status = Cell.CellStatus.Diagnostics;
+                Log(cell, "Начата диагностика");
+
+                double diagnosticValue = 0;
 
                 for (int i = 0; i < cell.DiagnosticIterations; i++)
                 {
@@ -39,89 +53,131 @@ namespace BatteryStation
                     {
                         token.ThrowIfCancellationRequested();
                     }
-                    result += Math.Sqrt(i + 1) * Math.Sin(i);
 
+                    diagnosticValue +=
+                        Math.Sqrt(i + 1) * Math.Sin(i);
                 }
-                cell.Status = Cell.CellStatus.WaitingForCharger;
-                _charger.Wait(token);
-                isChargerAcquired = true;
-                cell.Status = Cell.CellStatus.Charging;
 
-
-                token.WaitHandle.WaitOne(cell.ChargeDurationMs);
                 token.ThrowIfCancellationRequested();
 
-                if (isChargerAcquired == true)
+                Log(cell, "Диагностика завершена");
+
+                // 2. Зарядка
+
+                cell.Status = Cell.CellStatus.WaitingForCharger;
+                Log(cell, "Ожидание зарядного места");
+
+                try
+                {
+                    _charger.Wait(token);
+                    isChargerAcquired = true;
+
+                    cell.Status = Cell.CellStatus.Charging;
+                    Log(cell, "Зарядка началась");
+
+                    bool canceled = token.WaitHandle.WaitOne(
+                        cell.ChargeDurationMs
+                    );
+
+                    if (canceled)
+                    {
+                        throw new OperationCanceledException();
+                    }
+
+                    cell.Status = Cell.CellStatus.WaitingForCalibration;
+                    Log(cell, "Зарядка завершена");
+                }
+                finally
+                {
+                    if (isChargerAcquired)
+                    {
+                        _charger.Release();
+                        isChargerAcquired = false;
+
+                        Log(cell, "Зарядное место освобождено");
+                    }
+                }
+
+                // 3. Калибровка
+
+                Log(cell, "Ожидание калибровочного стенда");
+
+                int waitResult = WaitHandle.WaitAny(
+                    new WaitHandle[]
+                    {
+                        _calibrationMutex,
+                        token.WaitHandle
+                    }
+                );
+
+                if (waitResult == 1)
+                {
+                    throw new OperationCanceledException();
+                }
+
+                isMutexAcquired = true;
+
+                token.ThrowIfCancellationRequested();
+
+                cell.Status = Cell.CellStatus.Calibration;
+                Log(cell, "Калибровка началась");
+
+                bool calibrationCanceled = token.WaitHandle.WaitOne(
+                    cell.CalibrationDurationMs
+                );
+
+                if (calibrationCanceled)
+                {
+                    throw new OperationCanceledException();
+                }
+
+                cell.Status = Cell.CellStatus.Completed;
+                Log(cell, "Калибровка завершена");
+            }
+            catch (OperationCanceledException)
+            {
+                cell.Status = Cell.CellStatus.Canceled;
+                Log(cell, "Обработка отменена");
+            }
+            catch (Exception ex)
+            {
+                cell.Status = Cell.CellStatus.Faulted;
+                error = ex.Message;
+
+                Log(cell, $"Ошибка: {ex.Message}");
+            }
+            finally
+            {
+                if (isChargerAcquired)
                 {
                     _charger.Release();
                     isChargerAcquired = false;
                 }
 
-
-
-
-                cell.Status = Cell.CellStatus.WaitingForCalibration;
-                
-                int waitResult = WaitHandle.WaitAny(new WaitHandle[]
-                                {
-                    _calibrationMutex,
-                    token.WaitHandle
-                                });
-
-                
-                if(waitResult == 0)
-                {
-                    isMutexAcquired = true;
-                    token.ThrowIfCancellationRequested();
-
-                    cell.Status = Cell.CellStatus.Calibration;
-
-                    token.WaitHandle.WaitOne(cell.CalibrationDurationMs);
-                    token.ThrowIfCancellationRequested();
-
-                    cell.Status = Cell.CellStatus.Completed;
-
-
-                }
-
-
-                else if (waitResult == 1)
-                {
-                    throw new OperationCanceledException();
-                }
-                
-
-
-
-
-            }
-            catch (OperationCanceledException)
-            {
-                cell.Status = Cell.CellStatus.Canceled;
-
-            }
-
-            catch (Exception ex)
-            {
-                cell.Status = Cell.CellStatus.Faulted;
-                error = ex.Message;
-            }
-            finally
-            {
-                if (isChargerAcquired == true)
-                {
-                    _charger.Release();
-                }
-                if (isMutexAcquired == true)
+                if (isMutexAcquired)
                 {
                     _calibrationMutex.ReleaseMutex();
+                    isMutexAcquired = false;
+
+                    Log(cell, "Калибровочный стенд освобождён");
                 }
-                
 
-                Console.WriteLine($"Обработка ячейки {cell.Id} завершена");
+                Log(cell, "Обработка ячейки завершена");
             }
-            return new CellResult(cell.Id, cell.Status, start, DateTime.Now, error);
 
+            return new CellResult(
+                cell.Id,
+                cell.Status,
+                start,
+                DateTime.Now,
+                error
+            );
+        }
+
+        public void Dispose()
+        {
+            _charger.Dispose();
+            _calibrationMutex.Dispose();
         }
     }
 }
